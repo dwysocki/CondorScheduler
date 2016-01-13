@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from os import path
 import sys
+from subprocess import check_call
 
 from . import condor, dag, input_grouper, util
 
@@ -28,10 +29,17 @@ def get_args():
              "(optional)")
     general.add_argument("-d", "--condor-dir",
         default="./condor_scheduler",
-        help="Directory to store all Condor files. "
+        help="Directory to store all Condor files without specified paths. "
              "(default ./condor_scheduler)")
     general.add_argument("--submit", action="store_true",
         help="Submit Condor jobs after creation. "
+             "(optional)")
+    general.add_argument("--dag",
+        help="File to write generated DAG to. "
+             "(default <condor-dir>/generated.dag)")
+    general.add_argument("--dag-args",
+        default="",
+        help="Arguments to pass to condor_submit_dag before DAG filename. "
              "(optional)")
     general.add_argument("--dot",
         help="Graphviz output file for DAG visualization. "
@@ -52,13 +60,13 @@ def get_args():
              "(default <condor-dir>/input/)")
     batch.add_argument("--batch-output",
         help="Output file for batch script. "
-             "(default <condor-dir>/batch.out.$(process))")
+             "(default <condor-dir>/batch.out.$(cluster).$(process))")
     batch.add_argument("--batch-error",
         help="Error file for batch script. "
-             "(default <condor-dir>/batch.err.$(process))")
+             "(default <condor-dir>/batch.err.$(cluster).$(process))")
     batch.add_argument("--batch-log",
         help="Log file for batch script. "
-             "(default <condor-dir>/batch.log.$(process))")
+             "(default <condor-dir>/batch.log.$(cluster).$(process))")
     batch.add_argument("--batch-condor",
         help="Condor file to generate for batch script. "
              "(default <condor-dir>/batch.condor)")
@@ -82,13 +90,13 @@ def get_args():
              "(required if --pre-script provided).")
     pre.add_argument("--pre-output",
         help="Output file for pre script. "
-             "(default <condor-dir>/pre.out.$(process))")
+             "(default <condor-dir>/pre.out)")
     pre.add_argument("--pre-error",
         help="Error file for pre script. "
-             "(default <condor-dir>/pre.err.$(process))")
+             "(default <condor-dir>/pre.err)")
     pre.add_argument("--pre-log",
         help="Log file for pre script. "
-             "(default <condor-dir>/pre.log.$(process))")
+             "(default <condor-dir>/pre.log)")
     pre.add_argument("--pre-condor",
         help="Condor file to generate for pre script. "
              "(default <condor-dir>/pre.condor)")
@@ -112,13 +120,13 @@ def get_args():
              "(required if --post-script provided)")
     post.add_argument("--post-output",
         help="Output file for post script. "
-             "(default <condor-dir>/post.out.$(process))")
+             "(default <condor-dir>/post.out)")
     post.add_argument("--post-error",
         help="Error file for post script. "
-             "(default <condor-dir>/post.err.$(process))")
+             "(default <condor-dir>/post.err)")
     post.add_argument("--post-log",
         help="Log file for post script. "
-             "(default <condor-dir>/post.log.$(process))")
+             "(default <condor-dir>/post.log)")
     post.add_argument("--post-condor",
         help="Condor file to generate for post script. "
              "(default <condor-dir>/post.condor)")
@@ -166,22 +174,29 @@ def fill_defaults(args, prefix):
             file_name = path.join(args.condor_dir, file_basename)
             setattr(args, attr, file_name)
 
+    suffix = ".$(cluster).$(process)" if prefix == "batch" else ""
+
     script = prefix+"_script"
     output = prefix+"_output"
     error  = prefix+"_error"
     log    = prefix+"_log"
     condor = prefix+"_condor"
 
+
+
     if getattr(args, script) is not None:
-        set_default(output, prefix+".out.$(process)")
-        set_default(error,  prefix+".err.$(process)")
-        set_default(log,    prefix+".log.$(process)")
+        set_default(output, prefix+".out"+suffix)
+        set_default(error,  prefix+".err"+suffix)
+        set_default(log,    prefix+".log"+suffix)
         set_default(condor, prefix+".condor")
 
     if prefix == "batch":
         input_dir = prefix+"_input_dir"
         set_default(input_dir, "input")
 
+    # DIRTY HACK WARNING:
+    #   set default DAG file here, even though it's unrelated to prefix
+    set_default("dag", "generated.dag")
 
 def confirm_inputs(args, prefix):
     """
@@ -242,9 +257,10 @@ def make_dag_file(args, input_filenames):
     # or become lists ["pre"] and ["post"]
     #
     # batch is known ahead of time to be [0, 1, ..., len(input_filenames)]
+    # given as strings, for consistency
     job_ids = {
         "pre"   : None,
-        "batch" : range(len(input_filenames)),
+        "batch" : [str(x) for x in range(len(input_filenames))],
         "post"  : None
     }
 
@@ -262,11 +278,36 @@ def make_dag_file(args, input_filenames):
     for i, fname in enumerate(input_filenames):
         contents += dag.make_job(i, args.batch_condor, fname, args.batch_args)
 
+    # append PARENT-CHILD entries
+    if job_ids["pre"] is not None:
+        contents += dag.parent_template(parents=job_ids["pre"],
+                                        children=job_ids["batch"])
+    if job_ids["post"] is not None:
+        contents += dag.parent_template(parents=job_ids["batch"],
+                                        children=job_ids["post"])
 
-    ## TODO ##
-    # make parent-child relationships
+    # append DOT entry to output visualization
+    if args.dot:
+        contents += dag.dot_template(dot=args.dot)
 
-    return contents, job_ids
+    return contents
+
+
+def save_dag_file(contents, fname):
+    with open(fname, "w") as f:
+        f.write(contents)
+
+
+def save_condor_file(contents, args, prefix):
+    fname = getattr(args, prefix+"_condor")
+
+    with open(fname, "w") as f:
+        f.write(contents)
+
+
+def submit_dag(fname, options):
+    system_call = ["condor_submit_dag"] + options.split() + [fname]
+    check_call(system_call)
 
 
 def main():
@@ -276,6 +317,7 @@ def main():
     args = get_args()
 
     # split lines from stdin into input files
+    # saves each file to disc, and produces a list of their file paths
     input_file_names = input_grouper.make_files(sys.stdin.readlines(),
                                                 args.batch_input_dir,
                                                 args.min_size, args.max_jobs)
@@ -284,18 +326,20 @@ def main():
     condor_file_contents_map = make_condor_files(args)
 
     # create Condor DAG file contents,
-    # as well as a mapping from prefix -> [job ID, ...]
-    dag_file_contents, job_id_map = make_dag_file(args, input_file_names)
+    dag_file_contents = make_dag_file(args, input_file_names)
 
-    ## TODO ##
-    # save to file
+    # save Condor files
+    for prefix, contents in condor_file_contents_map.items():
+        save_condor_file(contents, args, prefix)
 
+    # save DAG file
+    save_dag_file(dag_file_contents, args.dag)
 
-    ## TODO ##
-    # optionally submit to condor (also gotta add CLI option to pass args)
+    if args.submit:
+        submit_dag(args.dag, args.dag_args)
 
-    print_contents(condor_file_contents_map)
-    print_contents({"DAG": dag_file_contents})
+#    print_contents(condor_file_contents_map)
+#    print_contents({"DAG": dag_file_contents})
 
 
 
