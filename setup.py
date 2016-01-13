@@ -38,7 +38,7 @@ def setup_package():
             'HTCondor',
             'batch processing'
         ],
-        classifiers=[f for f in CLASSIFIERS.split('\n') if f],
+        classifiers=[f for f in CLASSIFIERS.split('\n') if f]
     )
 
     from setuptools import setup
